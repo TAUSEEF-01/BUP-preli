@@ -101,6 +101,16 @@ def test_whole_result_is_rejected_when_one_entry_is_invalid():
         check([entry(0, "no_op", None), entry(1, "solar_reduction", {"hours": [1], "factor": 2})])
 
 
+@pytest.mark.parametrize(("kind", "key"), [
+    ("solar_reduction", "factor"),
+    ("minimum_battery_reserve", "minimum_energy_kwh"),
+    ("max_grid_window", "max_grid_kwh"),
+])
+def test_oversized_model_integer_is_a_guardrail_error(kind, key):
+    huge = 10 ** 400
+    rejects([entry(0, kind, {"hours": [1], key: huge})], fragment="finite")
+
+
 def test_non_object_output_is_rejected():
     with pytest.raises(GuardrailError):
         validate_interpretations([entry(0, "no_op", None)], 1, CAPACITY)

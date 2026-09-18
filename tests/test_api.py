@@ -2,8 +2,12 @@ import copy
 import json
 
 import pytest
+from fastapi.testclient import TestClient
 
+from app.config import Settings
+from app.llm.interpreter import Interpreter
 from app.llm.providers import ProviderError
+from app.main import create_app
 from app.schemas import HOURLY_PLAN_FIELDS, RESPONSE_FIELDS
 from tests.conftest import FakeProvider, ground_truth_handler, load_public_cases, make_client
 
@@ -16,6 +20,13 @@ BAD_ANSWER = json.dumps({"interpretations": [
     {"note_index": 1, "applies": False, "directive_type": "no_op", "structured_adjustment": None,
      "explanation": "x"},
 ]})
+HUGE_NUMBER_ANSWER = (
+    '{"interpretations":['
+    '{"note_index":0,"applies":true,"directive_type":"solar_reduction",'
+    '"structured_adjustment":{"hours":[12],"factor":1' + '0' * 400 + '},"explanation":"x"},'
+    '{"note_index":1,"applies":false,"directive_type":"no_op",'
+    '"structured_adjustment":null,"explanation":"x"}]}'
+)
 
 
 def post(client, payload):
@@ -178,6 +189,14 @@ def test_invalid_output_is_repaired_once():
     assert "factor" in repair_request and "failed validation" in repair_request
 
 
+def test_oversized_model_number_uses_normal_repair_path():
+    provider = FakeProvider(responses=[HUGE_NUMBER_ANSWER, GOOD_ANSWER])
+    with make_client(provider) as client:
+        response = post(client, SAMPLE["input"])
+    assert response.status_code == 200
+    assert len(provider.calls) == 2
+
+
 def test_invalid_output_twice_is_a_500_and_never_becomes_no_op():
     provider = FakeProvider(responses=[BAD_ANSWER, BAD_ANSWER])
     with make_client(provider) as client:
@@ -225,3 +244,22 @@ def test_unknown_route_and_method_return_json():
     with make_client() as client:
         assert client.get("/nope").json()["error"] == "not_found"
         assert client.get("/optimize-energy").json()["error"] == "method_not_allowed"
+
+
+def test_unexpected_error_is_generic_and_does_not_log_a_traceback(monkeypatch, caplog):
+    async def fail(*args, **kwargs):
+        raise RuntimeError("internal detail")
+
+    monkeypatch.setattr("app.main.run_pipeline", fail)
+    provider = FakeProvider(handler=ground_truth_handler(CASES))
+    settings = Settings(warmup=False)
+    interpreter = Interpreter(settings, [provider])
+    with TestClient(
+        create_app(settings, interpreter), raise_server_exceptions=False
+    ) as client:
+        response = post(client, SAMPLE["input"])
+    assert response.status_code == 500
+    assert response.json()["message"] == "The request could not be processed. Please retry later."
+    assert "unhandled error: RuntimeError" in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "internal detail" not in caplog.text

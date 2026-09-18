@@ -81,7 +81,8 @@ def create_app(settings: Settings | None = None, interpreter: Interpreter | None
 
     @app.exception_handler(Exception)
     async def unhandled_error(_: Request, exc: Exception) -> JSONResponse:
-        logger.error("unhandled error: %s", type(exc).__name__, exc_info=True)
+        # The participant guide forbids stack traces in logs as well as responses.
+        logger.error("unhandled error: %s", type(exc).__name__)
         return _error(500, GENERIC_500)
 
     @app.get("/health")
