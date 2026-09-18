@@ -1,358 +1,584 @@
-# GridWise LLM — Implementation Plan
+# GridWise LLM — Verified Implementation Plan
 
 BUP CSE Fest 2026 Hackathon · Online Preliminary
 
-**Status:** draft, waiting for team decisions (§1) · Written 2026-09-18, 19:20 BST · Round deadline 23:00 BST
+**Status:** specification audit complete; implementation not yet present in this repository
 
 ---
 
-## 0. Summary
+## 0. Authority and audit result
 
-We are building one public HTTP API:
+This plan was checked against all three organizer-provided files in this repository:
 
-- `GET /health` returns `{"status":"ok"}`.
-- `POST /optimize-energy` takes a 24-hour energy scenario plus 1–3 operator notes. It returns a directive interpretation for every note and a valid, minimum-cost 24-hour schedule.
+1. `BUP_CSE_FEST_2026_Preliminary_Problem_Statement_GridWise_LLM.pdf` — canonical for challenge behavior, API schemas, directives, guardrails, battery rules, energy accounting, and optimization validity.
+2. `BUP_CSE_FEST_2026_Participant_Guide_&_Evaluation_Rubric_GridWise_LLM.pdf` — canonical for deployment, repository policy, submission, performance, scoring, penalties, and tie-breaks.
+3. `BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json` — ten worked examples for local validation, not the hidden judge set.
 
-How it works: an LLM reads each note and returns a small JSON directive. Deterministic guardrails check and normalize it. A linear program (HiGHS via SciPy) computes the cheapest valid schedule. A replay validator then runs the judge's checks on our own output before we respond.
+The earlier draft had the correct high-level LLM → guardrails → optimizer → replay architecture, but several details were unsafe or unsupported by the specification. This revision corrects them:
 
-**Already verified:** the LP, given the organizers' ground-truth directives, reproduces all 10 public reference costs exactly (38,365 · 42,885 · 35,480 · 40,495 · 33,950 · 34,090 · 38,550 · 37,665 · 34,873 · 41,620 BDT). The optimizer design is settled. The main remaining risk is how accurately the LLM reads paraphrased notes.
+- A deterministic phrase parser must not produce the final interpretation when all LLM calls fail. That would create requests whose operator-note path contains no language model, contrary to the mandatory LLM requirement. Provider exhaustion now ends in a controlled internal error.
+- Invalid model output must not be silently converted to `no_op`. `no_op` is only for a note that genuinely does not affect the current schedule.
+- Directives remain hard constraints. The service must never return a “relaxed” plan that knowingly violates one.
+- Overlapping solar-reduction directives are enforced as individual upper bounds, equivalent to using the smallest remaining factor for that hour. Multiplying factors is not stated by the problem and can make a valid plan unnecessarily expensive.
+- `factor = 1.0` remains a valid `solar_reduction`; the canonical guardrail explicitly allows the inclusive range `[0, 1]`. It must not automatically become `no_op`.
+- The retry and timeout policy now fits within the 30-second request timeout and is designed around the 5-second p95 scoring threshold.
+- The implementation belongs in this repository. Creating a nested Git repository would complicate submission and history.
+- The plan no longer claims that an optimizer has already been implemented. Only the organizer reference outputs and an independent audit of them have been verified so far.
+
+### Verified public baseline
+
+An independent replay of every public `expected_output` confirmed all ten schedules satisfy their published directives, hourly energy balance, effective-solar limits, battery transitions/bounds/rates, end-of-day neutrality, and reported aggregates. A separate 0.5 kWh state-grid dynamic program reproduced every published optimal cost:
+
+| Case | Cost (BDT) |
+|---|---:|
+| SAMPLE-01 | 38,365 |
+| SAMPLE-02 | 42,885 |
+| SAMPLE-03 | 35,480 |
+| SAMPLE-04 | 40,495 |
+| SAMPLE-05 | 33,950 |
+| SAMPLE-06 | 34,090 |
+| SAMPLE-07 | 38,550 |
+| SAMPLE-08 | 37,665 |
+| SAMPLE-09 | 34,873 |
+| SAMPLE-10 | 41,620 |
+
+These are regression targets, not values to hard-code.
 
 ---
 
-## 1. Decisions needed
+## 1. Required outcome
 
-| # | Decision | Default |
-|---|---|---|
-| 1 | **LLM provider and model.** Which paid key can we get? Phase 1 needs no key, so there is time until about 20:25. | Whichever key we can get fastest, plus a second provider as backup. The code supports Claude through the official `anthropic` SDK (`claude-opus-5` at low effort, or `claude-haiku-4-5` for more speed and lower cost). It also supports any OpenAI-compatible API: OpenAI, Groq, Gemini or OpenRouter. The model name is an env var. Free tiers (Groq, Gemini) have daily caps, which is risky during judging. Latency is measured against the 5 s target; the team decides whether to switch models. |
-| 2 | **Hosting.** It must stay awake and have a public URL. | Railway, a paid Render instance (the free one sleeps), a Hugging Face Docker Space built from the Docker Hub image, or a VPS we already have. |
-| 3 | **Rule-based last-resort interpreter.** It runs only if every LLM call fails, and it is flagged in logs and in the explanation. | ON. It keeps the service answering when the provider is down or when judges run the Docker image without our key. The LLM stays the primary interpreter, so this is allowed. |
-| 4 | **Stack and location** | Python 3.12 + FastAPI, in a new `gridwise-llm/` folder inside this workspace with its own git repo. The organizer PDFs stay outside the repo. |
+Build and deploy one public JSON HTTP service:
+
+- `GET /health` returns HTTP 200 and `{"status":"ok"}` when ready.
+- `POST /optimize-energy` accepts one 24-hour scenario and 1–3 operator notes, uses a language-capable generative model to interpret every note, deterministically validates the interpretations, applies every relevant directive as a hard optimization constraint, and returns the exact required response schema.
+
+Correctness comes before price. The judge independently replays the schedule using organizer ground-truth directives, and only valid cases receive optimization credit.
+
+The implementation should target the rubric in this order:
+
+1. exact API and schema;
+2. LLM interpretation accuracy;
+3. deterministic guardrails;
+4. directive application and energy correctness;
+5. optimal cost;
+6. reliability and latency;
+7. deployment, Docker, and documentation;
+8. the three-minute tie-break video.
 
 ---
 
 ## 2. Architecture
 
-```
+```text
 POST /optimize-energy
- 1 Request validation ─── 400 malformed/structural · 422 semantic
- 2 LLM interpreter ────── primary → 1 repair retry → secondary provider → rule fallback
-                          (cache by notes+battery hash, temperature 0, JSON-schema output)
- 3 Guardrails ─────────── enums, note mapping, windows→hours, %→kWh, ranges, applies/null rules
- 4 Constraint builder ─── effective solar, reserve floor[h], charge/discharge caps[h], grid cap[h]
- 5 LP optimizer ───────── min cost → tie-break (least battery cycling at the same cost)
-                          infeasible → relaxed LP (base rules hard, directive violations minimized)
- 6 Post-processor ─────── net flow → action/kWh, rounding, recompute energy & grid, totals
- 7 Replay validator ───── the judge's checklist on our own output; re-solve with margins on failure
- 8 Response builder ───── exact field order + deterministic plan_summary
+  1. Parse and validate request
+  2. Interpret all notes with an LLM using structured output
+  3. Deterministically validate the complete interpretation
+     ├─ valid: continue
+     └─ invalid: bounded repair/backup-model attempt, otherwise controlled 500
+  4. Compile validated directives into hard hourly constraints
+  5. Solve the minimum-cost linear program
+     └─ infeasible: do not relax directives; diagnose/retry interpretation or fail safely
+  6. Convert solver variables to the exact response schema
+  7. Replay every organizer rule against the candidate response
+     ├─ valid: return HTTP 200
+     └─ invalid: retry numerical solve once, otherwise controlled 500
 ```
 
-The LLM understands the language. Deterministic code validates what it produced. The LP does the math. This matches the pipeline required in Problem Statement §03.
+The LLM performs semantic interpretation. Deterministic code validates structure and numeric ranges and compiles the accepted meaning into constraints. The optimizer performs scheduling. No rule-based phrase matcher replaces the LLM.
 
 ---
 
-## 3. Repository layout
+## 3. Proposed repository layout
 
-```
-gridwise-llm/
+Use the existing repository root rather than creating a nested repository:
+
+```text
+.
 ├── app/
-│   ├── main.py              FastAPI app, 2 routes, JSON error handlers (400/404/405/422/500)
-│   ├── config.py            env settings: providers, models, timeouts, flags (no secrets in code)
-│   ├── schemas.py           request/response + internal Directive models
-│   ├── request_parser.py    strict body parsing → 400 / 422
-│   ├── pipeline.py          orchestration, stage timings, 25 s internal deadline
+│   ├── main.py                 # FastAPI app and error handlers
+│   ├── config.py               # environment settings; no secret values
+│   ├── schemas.py              # request, response, and internal models
+│   ├── request_validation.py   # deterministic request checks
+│   ├── pipeline.py             # deadline-aware orchestration
 │   ├── llm/
-│   │   ├── prompt.py        system prompt, rules, ~8 original few-shot examples
-│   │   ├── providers.py     AnthropicProvider + OpenAICompatProvider (async, timeouts)
-│   │   └── interpreter.py   call → parse → guardrails → repair → fallback chain → cache
-│   ├── guardrails.py        validation + canonical structured_adjustment
-│   ├── rule_parser.py       last-resort deterministic interpreter
-│   ├── optimizer.py         LP (SciPy/HiGHS), tie-break stage, relaxed fallback
-│   ├── postprocess.py       schedule rows, rounding, totals
-│   ├── validator.py         judge-equivalent replay (shared with scripts)
-│   └── summary.py           plan_summary text
-├── tests/                   pytest, no LLM needed
+│   │   ├── prompt.py           # prompt and structured-output schema
+│   │   ├── providers.py        # primary and optional backup provider adapters
+│   │   └── interpreter.py      # call, validate, repair, and cache flow
+│   ├── guardrails.py           # exact interpretation guardrails
+│   ├── directives.py           # directive-to-hourly-constraint compilation
+│   ├── optimizer.py            # LP construction and solution
+│   ├── response_builder.py     # action rows, aggregates, and summary
+│   └── validator.py            # independent response replay
+├── tests/
+│   ├── test_api.py
+│   ├── test_guardrails.py
+│   ├── test_optimizer.py
+│   ├── test_replay.py
+│   └── test_public_cases.py
 ├── scripts/
-│   ├── eval_public.py       POSTs all public cases to any base URL → accuracy/validity/cost/p95 report
-│   └── paraphrase_bench.py  ~60 labelled paraphrases + distractors → accuracy per type and model
-├── data/                    public_samples.json, paraphrases.json
-└── Dockerfile, .dockerignore, requirements.txt, .env.example, .gitignore, README.md
+│   ├── eval_public.py
+│   └── eval_paraphrases.py
+├── eval_data/
+│   └── paraphrases.json        # original labelled development cases
+├── BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json
+├── Dockerfile
+├── .dockerignore
+├── .env.example
+├── .gitignore
+├── requirements.txt
+└── README.md
 ```
+
+The two organizer PDFs and public JSON remain reference artifacts. Tests may read the public JSON directly; do not duplicate or modify its expected results.
 
 ---
 
-## 4. Component details
+## 4. Request validation
 
-### 4.1 Request validation
+### 4.1 Structural validation — HTTP 400
 
-The raw body is parsed manually. FastAPI's default returns 422 for schema errors, but the spec wants 400.
+Return a controlled 400 JSON response for malformed JSON or a structurally invalid request, including:
 
-- **400 Bad Request:**
-  - bad JSON, `NaN`/`Infinity`, or a body that is not an object
-  - missing fields, or strings/bools where numbers are expected
-  - `hours` not exactly 24 unique hours 0–23
-  - `operator_notes` not 1–3 non-empty strings
-- **422 Unprocessable:**
-  - negative demand, solar or rate limits
-  - `minimum_energy_kwh > capacity_kwh`
-  - `initial_energy_kwh` outside [min, capacity]
-- Unsorted hours are sorted, unknown extra fields are ignored, and note length is capped before the LLM sees it.
+- body is not a JSON object;
+- missing required top-level, hour, or battery fields;
+- wrong JSON types, treating booleans as invalid numbers;
+- non-finite numbers such as `NaN` or infinity;
+- `hours` is not exactly 24 entries containing each integer hour 0–23 exactly once;
+- `operator_notes` is not an array of 1–3 non-empty strings.
 
-### 4.2 LLM interpreter
+Incoming hour rows may be normalized to ascending hour order internally. Do not truncate a valid operator note before interpretation, because truncation could change its meaning. A separate generous HTTP body-size limit may protect the service from abuse.
 
-Most of the score depends on this step. Interpretation is worth 25 points on its own. Application (25) and optimization (10) only score when the directive was read correctly.
+### 4.2 Semantic validation — HTTP 422 (optional by specification)
 
-The LLM returns the meaning it read, and code does the arithmetic:
+Use a controlled 422 consistently for well-formed but impossible or out-of-domain input, including:
+
+- negative demand, solar, tariff, capacity, reserve, or charge/discharge rate;
+- `minimum_energy_kwh > capacity_kwh`;
+- `initial_energy_kwh` outside `[minimum_energy_kwh, capacity_kwh]`.
+
+All numeric inputs must be finite. Error bodies must not expose stack traces, prompts, credentials, or provider responses.
+
+---
+
+## 5. LLM interpretation
+
+### 5.1 Mandatory role
+
+The language model must interpret `operator_notes` into the structured directives that are used by the optimizer. Using a model only for `plan_summary`, documentation, or cosmetic text is non-compliant. Hard-coded phrase matching cannot be the sole interpreter and must not become the final interpreter during provider failure.
+
+Use one structured-output call for all 1–3 notes when possible. Give the model:
+
+- the notes with explicit data delimiters and prompt-injection warnings;
+- the six allowed directive types and exact adjustment shapes;
+- the start-inclusive/end-exclusive hour convention;
+- the battery capacity, so a percentage reserve can become kWh;
+- rules that unsupported or irrelevant effects map to `no_op` rather than a fabricated directive;
+- a small, diverse set of original examples that does not encourage matching public phrases.
+
+The model should emit the final machine-checkable fields for each note:
 
 ```json
-{"interpretations": [{
-  "note_index": 0,
-  "reasoning": "≤30 words: what, when, how much",
-  "directive_type": "solar_reduction",
-  "windows": [{"start_hour": 13, "end_hour": 15}],
-  "solar_factor": 0.2,
-  "reserve_kwh": null, "reserve_percent_of_capacity": null,
-  "max_grid_kwh": null,
-  "explanation": "Solar cut to 20% during panel cleaning."}]}
+{
+  "interpretations": [
+    {
+      "note_index": 0,
+      "applies": true,
+      "directive_type": "solar_reduction",
+      "structured_adjustment": {
+        "hours": [13, 14],
+        "factor": 0.2
+      },
+      "explanation": "Usable solar is reduced during the stated window."
+    }
+  ]
+}
 ```
 
-- **Why this format:** LLMs rarely misread "until 9 PM", but they often get hour lists wrong. So code expands `[start, end)` into hours (including windows that wrap past midnight), converts % of capacity to kWh, and sets `applies` and `null` itself.
-- **Vocabulary per type:**
-  - PV, panels, inverter, cloud, washing → `solar_reduction`
-  - charger isolated, charging circuit down → `no_charge_window`
-  - relay or protection test, battery output locked → `no_discharge_window`
-  - keep at least, backup, must not fall below → `minimum_battery_reserve`
-  - feeder, transformer, substation, intake, grid outage (cap 0) → `max_grid_window`
-- **Time rules:**
-  - noon = 12; midnight = 0 as a start and 24 as an end; 24-hour clock ("13:00"); number words ("from one until three")
-  - "for N hours from X" → [X, X+N); "after X" or "rest of the day" → [X, 24); "until X" → [0, X); "all day" → [0, 24)
-  - a single hour, e.g. "at 5 PM" → [17, 18)
-  - `end_hour` is the clock hour where the window ends; code excludes it, so the LLM never subtracts one
-  - missing AM/PM: context words decide (morning → AM; afternoon, evening, night → PM; solar notes → daytime), otherwise 1–6 → PM and 7–11 → AM
-- **Value rules:**
-  - The solar factor is the fraction that remains: "80% reduction" → 0.2, "drop to 20%" → 0.2, "one-fifth of normal" → 0.2, "halved" → 0.5, "offline" → 0.
-  - Reserves are in kWh or % of capacity; capacity and base minimum are passed in the prompt.
-  - The grid cap is kWh per hour.
-- **no_op rules:**
-  - unrelated topics (cafeteria, library, registration, …)
-  - other days (tomorrow, next week, yesterday), even if energy-related
-  - effects the spec doesn't support: demand, tariff or capacity changes, solar increases
-  - EV or phone chargers, which are not the campus battery
-- **Safety:** notes are passed as marked-off data, so instructions written inside a note are not followed.
-- **Few-shot examples:** written from scratch, not copied from the public cases, as the rules require.
-- **Settings:** temperature 0, provider-native JSON schema output, and a cache keyed on notes and battery parameters.
-- **Fallback chain:**
-  1. primary call (8 s timeout)
-  2. one repair retry with the validation errors
-  3. secondary provider
-  4. rule parser
+Requiring final `hours` and final numeric values from the model keeps the LLM visibly in the semantic path. Deterministic code may sort/deduplicate an otherwise identical hours list only if the semantic content is unchanged; a wrong or ambiguous time/value must be repaired by a model, not guessed by code.
 
-  The whole chain is capped at about 20 s, so every request finishes well under the 30 s judge timeout.
+### 5.2 Supported meanings
 
-### 4.3 Guardrails
+Only these final interpretations are allowed:
 
-| Check | On failure |
+| Type | Exact `structured_adjustment` |
 |---|---|
-| JSON parse, schema, `directive_type` enum | 1 repair retry with the exact error list |
-| One entry per note, indices 0..N-1, no duplicates | Repair (missing notes only) |
-| Window hours are integers; start 0–23, end 1–24; non-empty unless no_op | Repair |
-| Factor finite and in [0,1]; 1.0 means no change, so it becomes no_op | Repair |
-| Reserve finite, ≥ 0, ≤ capacity after % conversion | Repair |
-| `max_grid_kwh` finite, ≥ 0 | Repair |
-| Still invalid after repair | That note goes to the rule parser, otherwise `no_op` ("could not be safely interpreted"). Never invented. |
+| `solar_reduction` | `{"hours":[...], "factor": number}` |
+| `minimum_battery_reserve` | `{"hours":[...], "minimum_energy_kwh": number}` |
+| `no_charge_window` | `{"hours":[...]}` |
+| `no_discharge_window` | `{"hours":[...]}` |
+| `max_grid_window` | `{"hours":[...], "max_grid_kwh": number}` |
+| `no_op` | `null` |
 
-Code always writes the final entry: hours sorted and unique, exact keys per type, `applies = (type != no_op)`, and `structured_adjustment = null` for no_op. The LLM has no field that could change demand, solar, tariff or battery parameters, so "no invention" holds by construction.
+Important semantic rules:
 
-### 4.4 Optimizer (already tested)
+- every note maps to exactly one entry and exactly one supported type;
+- windows include the start hour and exclude the end hour;
+- `factor` is the usable fraction remaining: an 80% reduction means `0.2`;
+- `factor = 1.0` is allowed and remains `solar_reduction` if that is what the note says;
+- a stated reserve below the base battery minimum is still returned as `minimum_battery_reserve`; the optimizer later takes the maximum of the two floors;
+- irrelevant notes and unsupported schedule changes use `no_op` with `applies = false` and a null adjustment;
+- the model must not change demand, tariff, battery parameters, or any other base input.
 
-Per hour: grid `g`, solar used `s`, charge `c`, discharge `d` (all ≥ 0), and battery energy `E`.
+Do not encode undocumented deterministic guesses such as “1–6 without AM/PM always means PM.” Let the model use the note's language and context. Add labelled test cases for ambiguous clocks, noon/midnight, number words, percentages, and paraphrases. Cross-midnight wording is not explicitly defined by the organizer documents; the most natural candidate mapping is the sorted set of covered hours (for example, 10 PM–2 AM → `[0,1,22,23]`), but this remains a tested interpretation assumption rather than a canonical rule.
 
-- **Energy:**
-  - `g + s + d = demand + c`
-  - `E[h] = E[h-1] + c - d`
-  - `E[23] = initial`
-- **Limits:**
-  - `max(base_min, reserve[h]) ≤ E[h] ≤ capacity`
-  - `s ≤ solar·factor`
-  - `c ≤ rate` (0 in no-charge hours); `d ≤ rate` (0 in no-discharge hours)
-  - `g ≤ cap[h]`
-- **Two stages:** first minimize Σ tariff·g. Then hold that cost fixed and minimize Σ(c+d), which only removes pointless charge/discharge cycling.
-- **Overlapping directives combine conservatively:** solar factors multiply, reserves take the max, caps take the min, and windows are merged.
-- **Infeasible model** (only possible if the interpretation is wrong): solve a relaxed LP where base rules stay hard and directive violations are minimized, and log it.
-- **Size:** about 120 variables; solves in about 10 ms.
+### 5.3 Guardrails
 
-### 4.5 Post-processing and replay
+Treat model output as untrusted until every check passes:
 
-- `net = c − d` decides charge, discharge or idle (idle means `battery_kwh = 0`).
-- **Rounding:**
-  - Flows are rounded to 6 decimals.
-  - Energy and grid are recomputed from the rounded flows, so every equation holds to about 1e-9.
-  - Solar used is clamped to effective solar, the end-of-day battery residual is corrected, and `-0.0` never appears.
-- Totals (`total_grid_kwh`, `total_cost_bdt`, `peak_grid_kwh`) come from the final rows.
-- The replay validator runs every judge check from Problem Statement §11.3 plus each directive. If anything fails, the LP is re-solved with small safety margins.
+- exactly one entry per input note, in `note_index` order `0..N-1`;
+- no missing, duplicate, or out-of-range indices;
+- `directive_type` is one of the six allowed values;
+- `hours` is a non-empty array of unique ascending integers from 0 through 23 for every applicable directive;
+- `solar_reduction.factor` is finite and in `[0,1]`;
+- `minimum_energy_kwh` is finite, non-negative, and no greater than battery capacity;
+- `max_grid_kwh` is finite and non-negative;
+- adjustment keys exactly match the selected directive shape;
+- `no_op` has `applies = false` and `structured_adjustment = null`;
+- every other type has `applies = true` and a non-null adjustment.
 
-### 4.6 API
+Failure policy:
 
-- `GET /health` returns `{"status":"ok"}` and never calls the LLM. The app starts even with no API key, which the Docker check needs.
-- Response fields come out in the exact spec order: `scenario_id`, `directive_interpretation`, `hourly_plan`, `total_grid_kwh`, `total_cost_bdt`, `peak_grid_kwh`, `plan_summary`.
-- `plan_summary` is a fixed-template text: directives applied, notes ignored, charge and discharge hours, and cost.
-- 500 responses carry a generic JSON message. No stack traces or secrets appear in responses or logs.
+1. Reject the entire model result if any entry is invalid; do not partially invent replacements.
+2. Make at most one deadline-aware repair call with validation errors and the original notes.
+3. If configured, try one independent backup language model with the original task.
+4. If no valid complete interpretation is obtained, return a generic controlled HTTP 500. Never relabel the failed note as `no_op`, and never continue with a rule-only interpretation.
 
----
+### 5.4 Latency, retries, and cache
 
-## 5. Testing
+The judge timeout is 30 seconds, while p95 at or below 5 seconds receives full latency credit. Therefore:
 
-- **pytest (no LLM needed):**
-  - the optimizer with the correct directives hits all 10 reference costs
-  - the validator passes the reference plans and catches injected violations
-  - guardrail checks, every 400/422 path, and the response schema
-- **`scripts/eval_public.py`:** runs end-to-end against localhost, then against the deployed URL. Target: 10/10 interpretations, 10/10 valid plans, cost ratio 1.000, p95 under 5 s.
-- **`scripts/paraphrase_bench.py`:** about 60 labelled notes (seeded from Appendix C) to pick the model and tune the prompt.
-- **Optional add-ons**, kept only if the bench shows they help:
-  - a disagreement check, where a short LLM re-check decides when the rule parser and the LLM disagree
-  - conservative hedging, which schedules against the stricter of two candidate readings (valid under either reading, at a small cost)
+- use a fast structured-output-capable primary model;
+- impose a short primary timeout appropriate to the measured deployment latency;
+- start a repair or backup attempt only if enough of the request deadline remains;
+- reserve time for optimization, replay, serialization, and network overhead;
+- cap the whole pipeline below 30 seconds, preferably well below it;
+- benchmark the actual deployed provider before fixing timeout values.
+
+An in-memory bounded cache is acceptable because cached interpretations were originally produced by an LLM. Its key must include the exact notes, battery context, prompt/schema version, provider/model identifier, and any setting that can affect interpretation. Do not hard-code public case IDs, notes, outputs, or numeric values.
 
 ---
 
-## 6. Deployment and submission
+## 6. Directive compilation
 
-- **Dockerfile:** `python:3.12-slim`, non-root user, `uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}`, HEALTHCHECK. `.dockerignore` excludes `.env`, so no secrets end up in the image.
-- **Image:** push `docker.io/<user>/gridwise-llm:1.0.0` and record its digest.
-- **Deploy early**, as soon as the public samples pass, so hosting problems show up early. Later changes are just redeploys.
-- **Test from outside** the dev machine: `/health` plus `eval_public.py` against the public URL.
-- **README:** one section per documentation scoring point (outline in Appendix D).
-- **Video:** 3 minutes, tie-break only (outline in Appendix E).
+Start with per-hour base values:
 
-**Submission checklist**
+- `effective_solar[h] = original_solar[h]`;
+- `reserve_floor[h] = battery.minimum_energy_kwh`;
+- charge and discharge upper bounds equal their base hourly rates;
+- grid upper bound is unbounded.
 
-| # | Item |
+Apply every validated directive:
+
+- `solar_reduction`: for each listed hour, add `solar_used[h] <= original_solar[h] * factor`;
+- `minimum_battery_reserve`: raise `reserve_floor[h]` with `max`;
+- `no_charge_window`: set the charge upper bound to zero;
+- `no_discharge_window`: set the discharge upper bound to zero;
+- `max_grid_window`: lower the grid upper bound with `min`;
+- `no_op`: make no model change.
+
+If multiple solar reductions cover one hour, keeping all individual upper bounds is equivalent to the smallest factor, not the product of factors. This satisfies every stated reduction without inventing an additional compounded reduction.
+
+Organizer scoring scenarios are promised to have feasible, non-contradictory ground-truth directives. If the compiled model is infeasible, treat that as a likely interpretation or implementation error. A bounded independent LLM retry may be attempted if time remains; otherwise fail safely. Do not soften a directive and return an invalid schedule.
+
+---
+
+## 7. Optimizer
+
+Use a continuous linear program such as HiGHS through SciPy. For each hour `h`, define non-negative variables:
+
+- `g[h]`: grid import;
+- `s[h]`: solar used;
+- `c[h]`: battery charge;
+- `d[h]`: battery discharge;
+- `E[h]`: battery energy after the hour.
+
+### 7.1 Hard constraints
+
+For every hour:
+
+```text
+g[h] + s[h] + d[h] = demand[h] + c[h]
+E[h] = E[h-1] + c[h] - d[h]
+reserve_floor[h] <= E[h] <= capacity
+0 <= s[h] <= every active solar upper bound
+0 <= c[h] <= active charge limit[h]
+0 <= d[h] <= active discharge limit[h]
+0 <= g[h] <= active grid cap[h]
+```
+
+For hour 0, use `initial_energy_kwh` in place of `E[-1]`. Enforce end-of-day neutrality exactly in the model:
+
+```text
+E[23] = initial_energy_kwh
+```
+
+Do not add charge/discharge efficiency, grid export, demand shifting, or other behavior absent from the specification.
+
+### 7.2 Objective and degeneracy
+
+Primary objective:
+
+```text
+minimize sum(g[h] * tariff_bdt_per_kwh[h])
+```
+
+The LP formulation permits simultaneous charge and discharge algebraically. Because the specified battery has no efficiency loss, a secondary solve may eliminate this degeneracy:
+
+1. solve for minimum grid cost;
+2. constrain cost to the optimum within a solver tolerance far below the judge's 0.01 BDT tolerance;
+3. minimize `sum(c[h] + d[h])`.
+
+The secondary objective must not sacrifice the primary optimum. An alternative is a solver formulation that directly prevents simultaneous flows, but that introduces integer variables and is unnecessary if the secondary solve and replay are reliable.
+
+---
+
+## 8. Response construction and independent replay
+
+### 8.1 Required response
+
+Return exactly the required top-level fields:
+
+- `scenario_id` copied from the request;
+- `directive_interpretation` with one entry per note in note order;
+- `hourly_plan` with 24 unique entries for hours 0–23;
+- `total_grid_kwh`;
+- `total_cost_bdt`;
+- `peak_grid_kwh`;
+- `plan_summary`.
+
+Each hourly entry contains exactly:
+
+- `hour`;
+- `grid_kwh`;
+- `solar_used_kwh`;
+- `battery_action`, one of `charge`, `discharge`, or `idle`;
+- non-negative `battery_kwh`, which is zero for `idle`;
+- `battery_energy_after_kwh`.
+
+JSON object key order is not semantically important, but array order should be deterministic and ascending.
+
+### 8.2 Numerical handling
+
+- Convert negligible solver noise to zero so `-0.0` is never emitted.
+- Derive the public battery action from the net flow after the secondary solve.
+- Emit enough decimal precision to stay comfortably within 0.01 kWh/BDT.
+- Recalculate battery energy sequentially and grid balance consistently from the final emitted flows.
+- Calculate all aggregates from the final emitted hourly rows, not directly from raw solver internals.
+- Do not “fix” a residual after solving if doing so can break a reserve, rate, solar, or grid-cap constraint.
+
+If the first serialization fails replay only because of numerical tolerance, solve again with small inward numerical margins and rebuild the response. If it still fails, return a controlled 500 instead of an invalid plan.
+
+### 8.3 Replay validator
+
+The replay validator must be independent enough to catch optimizer or serialization bugs. For the final emitted response it checks:
+
+- scenario ID echo and exact array lengths;
+- interpretation count, order, types, shapes, and numeric ranges;
+- hours 0–23 exactly once and in ascending order;
+- finite, non-negative numeric output;
+- action/`battery_kwh` consistency;
+- effective-solar limits after the organizer-style directive application;
+- no-charge, no-discharge, reserve, and grid-cap directives;
+- hourly energy balance;
+- battery transition, capacity, base/directed reserve, and rate limits;
+- final energy equal to initial energy;
+- totals and peak recalculated from `hourly_plan`;
+- cost recalculated using request tariffs.
+
+Use an absolute comparison tolerance no larger than the published 0.01 unless an official judge package later specifies a stricter value.
+
+---
+
+## 9. Error handling, security, and observability
+
+- `GET /health` must not call the LLM and must become ready within 60 seconds of startup.
+- A missing provider key may allow the process and health endpoint to start, but `POST /optimize-energy` must fail with a controlled generic error rather than bypassing the LLM requirement.
+- Valid requests should not produce 5xx responses under normal operation; provider quota, rate limits, and availability are deployment responsibilities.
+- Use bounded network timeouts and no unbounded retries.
+- Return generic 500 JSON; never return raw exceptions, provider payloads, prompts, or secrets.
+- Do not log authorization headers, API keys, `.env` contents, or full provider responses. Prefer request IDs, scenario IDs, stage timings, model identifiers, cache status, and sanitized error categories.
+- Notes are synthetic, but avoid unnecessary full-prompt logging.
+- Keep `.env`, credentials, local caches, and test artifacts out of Git and Docker build contexts.
+
+---
+
+## 10. Test plan
+
+### 10.1 Deterministic unit tests
+
+- request schema and every 400/422 branch;
+- each exact directive shape and each guardrail rejection;
+- one interpretation per note and strict note ordering;
+- factor, reserve, grid-cap, finite-number, and hour bounds;
+- every directive's compiled hourly constraints;
+- overlapping reserve/grid/solar constraints;
+- optimizer balance, bounds, rates, neutrality, and optimality on small hand-solvable cases;
+- replay validator catches one injected violation of every rule;
+- aggregation and floating-point boundary tests;
+- controlled provider/model failure without a rule-only fallback.
+
+### 10.2 Public sample regression
+
+For all ten cases in the organizer JSON:
+
+1. POST each `input` to the service.
+2. Compare structured directive semantics with `expected_output` while ignoring exact explanation wording.
+3. Replay the returned schedule independently.
+4. Recalculate totals and cost.
+5. Require valid cost equal to the public optimum within published tolerance.
+
+Target: 10/10 interpretation semantics, 10/10 valid schedules, all ten optimal costs, no 5xx responses.
+
+### 10.3 Paraphrase evaluation
+
+Build an original labelled set covering all six directive types, with:
+
+- alternate vocabulary and word order;
+- 12-hour and 24-hour clocks, noon/midnight, and number words;
+- reduction-versus-remaining percentages;
+- reserves in kWh and percentage of battery capacity;
+- grid caps, including zero;
+- multiple notes and distractors;
+- unsupported demand/tariff/capacity changes;
+- same-day versus clearly other-day notes;
+- prompt-injection-like text inside note delimiters;
+- ambiguous and cross-midnight wording tracked separately as assumptions.
+
+Report exact accuracy for applicability, directive type, hours, numeric value, and complete entry. Do not tune only against the ten public wordings.
+
+### 10.4 Reliability and deployment tests
+
+- repeated valid requests, concurrent requests, cache hits/misses, and provider timeout/failure;
+- measure p50/p95/p99 end-to-end latency on the deployed endpoint;
+- verify p95 against the rubric bands: ≤5 s, >5–15 s, >15–30 s, and timeout beyond 30 s;
+- call both endpoints from outside the development network;
+- build and run the submitted Docker image from a clean machine;
+- execute the README quickstart exactly as written;
+- scan the repository and image history for secrets.
+
+---
+
+## 11. Implementation phases
+
+### Phase 1 — deterministic core
+
+1. Add request/response schemas and controlled errors.
+2. Implement directive guardrails and constraint compilation.
+3. Implement the LP, response builder, and independent replay.
+4. Make all ten public cases pass using their organizer-provided directive interpretations, without calling an LLM.
+
+This phase validates optimization and serialization only; it does not satisfy the final LLM requirement by itself.
+
+### Phase 2 — interpretation path
+
+1. Select a structured-output-capable model/provider whose credentials and quota are available during judging.
+2. Implement the prompt, adapter, complete-output validation, one repair attempt, and optional backup LLM.
+3. Add the prompt/schema-versioned cache.
+4. Reach 10/10 public interpretations and strong held-out paraphrase accuracy.
+5. Verify the accepted interpretation is exactly what compiles into optimizer constraints.
+
+### Phase 3 — full pipeline and reliability
+
+1. Exercise model → guardrails → directives → optimizer → replay end to end.
+2. Tune deadline-aware timeouts using deployed latency measurements.
+3. Add concurrency limits and controlled provider failure behavior.
+4. Run regression, paraphrase, malformed-input, and repeated-request tests.
+
+### Phase 4 — packaging and submission
+
+1. Build a non-root Docker image that binds to `0.0.0.0` and exposes the documented port.
+2. Push an exact version tag and record its digest.
+3. Deploy an always-reachable public endpoint and test externally.
+4. Finish the self-contained README and verified copy-paste commands.
+5. Record a maximum three-minute architecture/solution video.
+6. Run the final checklist and make the repository public only after the submission deadline, per the rulebook.
+
+---
+
+## 12. Configuration decisions still required
+
+The organizer documents intentionally leave implementation technology open. The team must choose and verify:
+
+| Decision | Acceptance criterion |
 |---|---|
-| 1 | Public base URL (`/health`, `/optimize-energy`) |
-| 2 | Private GitHub repo, made public after the deadline |
-| 3 | README with quickstart, env var names, model/provider, solver, sample request/response |
-| 4 | Docker image with exact tag or digest, env var names, port, one verified `docker run` command |
-| 5 | Video of 3 minutes or less |
+| Primary model/provider | Structured output, strong paraphrase accuracy, sufficient quota, and deployed p95 compatible with scoring |
+| Optional backup LLM | Independent credentials/quota and usable only within the total deadline |
+| Hosting platform | Public, always reachable, supports secrets and the chosen solver, no cold start that threatens readiness/latency |
+| Container registry | Pullable throughout evaluation with exact tag/digest |
+| Solver packaging | Reproducible clean install/build and public-case optimality |
 
----
+Do not place speculative model identifiers in the committed plan. Record the actually tested provider/model and all required environment-variable names in the final README.
 
-## 7. Timeline (deadline 23:00 BST)
+Suggested environment-variable interface:
 
-| Time | Build track (Claude Code) | Team track (in parallel) |
-|---|---|---|
-| 19:20–19:35 | — | Review this plan and answer §1 |
-| 19:35–20:25 | Phase 1: schemas, request parser, LP, post-processing, validator, API, tests | Get LLM key(s); create the private GitHub repo; set up Docker Hub and hosting accounts |
-| 20:25–21:05 | Phase 2: providers, prompt, interpreter, guardrails, cache, fallback chain; public samples pass | Put keys in `gridwise-llm/.env` locally. Never paste keys in chat. |
-| 21:05–21:35 | Phase 3: Dockerfile, rule parser, paraphrase bench, prompt tuning | First deploy; test the public URL from outside |
-| 21:35–22:15 | Phase 4: README, fixes from the bench, redeploy | — |
-| 22:15–22:45 | Video outline, final checks | Record the video; submit |
-| 22:45–23:00 | Buffer | Buffer |
-
----
-
-## 8. Main risks
-
-| Risk | Mitigation |
+| Name | Purpose |
 |---|---|
-| A paraphrase is misread (hours, factor, relevance) | Meaning-first output format, detailed prompt, guardrails, paraphrase bench |
-| Provider down or rate-limited during judging | Cache, secondary provider, rule fallback, 25 s internal deadline |
-| Host sleeps, so the first request misses the 60 s health window | Always-on host |
-| Numeric edge cases (tolerance, `-0.0`, rounding drift) | Recompute from rounded values, then the replay validator |
-| Judges run the Docker image without our key | App still starts and `/health` works; the rule fallback answers, flagged |
+| `LLM_PROVIDER` | primary provider adapter |
+| `LLM_MODEL` | exact primary model identifier |
+| `LLM_API_KEY` | primary secret |
+| `LLM_BASE_URL` | optional compatible endpoint |
+| `LLM_BACKUP_PROVIDER` | optional backup adapter |
+| `LLM_BACKUP_MODEL` | optional backup model identifier |
+| `LLM_BACKUP_API_KEY` | optional backup secret |
+| `LLM_BACKUP_BASE_URL` | optional backup endpoint |
+| `REQUEST_DEADLINE_SECONDS` | total internal request deadline, below 30 seconds |
+| `LLM_CACHE_SIZE` | bounded in-memory interpretation cache |
+| `LOG_LEVEL` | logging level |
+| `PORT` | service port |
+
+Never commit real values for secret variables.
 
 ---
 
-## 9. Assumptions to confirm
+## 13. Submission and README checklist
 
-The spec does not settle these. The plan uses the choices below.
+The final package requires:
 
-1. A window that crosses midnight ("10 PM to 2 AM") wraps within the same day → hours `[0, 1, 22, 23]`.
-2. Missing AM/PM is resolved from context first, then by the default in §4.2.
-3. A note saying solar stays at 100% (factor 1.0) is reported as `no_op`.
-4. A reserve below the base minimum is still reported as `minimum_battery_reserve`; it just doesn't change the math.
-5. "Grid outage" or "no grid import" → `max_grid_window` with `max_grid_kwh = 0`.
-6. Several directives on the same hour: solar factors multiply, reserves take the max, caps take the min. Multiplying factors is the most conservative choice, so the plan stays valid however the judge combines them.
-7. Notes about another day are `no_op`, even if they mention energy.
-8. Structural errors return 400; semantic errors (negative values, min > capacity, initial outside [min, capacity]) return 422.
+- a working public base URL for both endpoints, with no login/VPN/manual approval;
+- the source repository created after question reveal, private during the event and public after the deadline;
+- a self-contained README;
+- a tested, pullable Docker fallback image with exact tag or digest;
+- an accessible solution video no longer than three minutes.
 
----
+The README must document:
 
-## Appendix A — Scoring rubric coverage
+1. architecture and the LLM's mandatory interpretation role;
+2. deterministic guardrails and optimizer/solver;
+3. clean local setup and exact run command;
+4. required environment-variable names, without values;
+5. `GET /health` and `POST /optimize-energy` examples;
+6. public-sample test command and expected result;
+7. Docker pull/run command, port, tag/digest, and runtime configuration;
+8. dependencies, credits, limitations, and secret handling;
+9. actual provider/model identifier used for judging.
 
-| Category (points) | Sub-items (from the Participant Guide §07) | Where the plan earns them |
-|---|---|---|
-| LLM Directive Interpretation (25) | 5 relevance/no_op · 5 type · 5 hours · 5 values/shape · 5 paraphrase robustness | §4.2 prompt and output format, §4.3 guardrails, paraphrase bench |
-| Directive Application & Constraint Correctness (25) | 10 ground-truth application · 5 energy balance/effective solar · 5 battery transitions/bounds/rates · 5 action consistency/neutrality/non-negative | §4.4 LP, §4.5 rounding and replay validator |
-| Optimization Quality (10) | min(1, organizer cost / our cost); invalid cases score 0 | Exact LP optimum (verified on 10/10 public cases) |
-| API Contract & Schema (10) | 2 endpoints/status · 2 request validation · 3 interpretation schema/order/types · 3 plan/top-level schema + scenario_id echo | §4.1, §4.6 |
-| Performance & Reliability (10) | 2 health readiness · 3 p95 latency (≤5 s full, 5–15 s 2/3, 15–30 s 1/3) · 3 stability · 2 failure handling and secret safety | Cache, timeouts, fallback chain, error handlers |
-| Deployment & Docker Fallback (10) | 3 live endpoint · 4 pullable image reaching `/health` · 2 clean startup · 1 no judge debugging | §6 |
-| Documentation & Local Reproducibility (10) | 3 quickstart · 2 env/config/model docs · 2 public-sample test + expected result · 1 architecture · 1 Docker · 1 deps/limitations/secrets | Appendix D |
+Final verification:
 
----
-
-## Appendix B — Environment variables (names only, never commit values)
-
-Final names will be confirmed in the README.
-
-| Name | Purpose | Default |
-|---|---|---|
-| `LLM_PROVIDER` | `anthropic` or `openai_compat` | — |
-| `LLM_MODEL` | model id, e.g. `claude-opus-5` | — |
-| `LLM_API_KEY` | primary provider key (secret) | — |
-| `LLM_BASE_URL` | endpoint for OpenAI-compatible providers (Groq, Gemini, OpenRouter) | provider default |
-| `LLM_FALLBACK_PROVIDER`, `LLM_FALLBACK_MODEL`, `LLM_FALLBACK_API_KEY`, `LLM_FALLBACK_BASE_URL` | secondary provider | unset |
-| `LLM_TIMEOUT_SECONDS` | per LLM call | 8 |
-| `REQUEST_DEADLINE_SECONDS` | whole request | 25 |
-| `ENABLE_RULE_FALLBACK` | last-resort interpreter on/off | `true` |
-| `LLM_CACHE_SIZE` | cached interpretations | 512 |
-| `LOG_LEVEL` | logging | `INFO` |
-| `PORT` | HTTP port | 8000 |
+- [ ] `/health` returns HTTP 200 and exactly the required readiness object.
+- [ ] `/optimize-energy` accepts the canonical request and returns every required field.
+- [ ] Every note has exactly one guarded LLM-produced interpretation in note order.
+- [ ] `no_op` and applicable-directive semantics are exact.
+- [ ] All directives are hard constraints and no relaxed invalid plan can be returned.
+- [ ] The final plan passes independent replay under organizer-style ground truth.
+- [ ] Aggregates exactly match the emitted hourly rows within tolerance.
+- [ ] Public regression is 10/10 valid and optimal.
+- [ ] Deployed p95 and failure rate have been measured under repeated requests.
+- [ ] Docker and README work from a clean environment.
+- [ ] Repository/image scans find no credentials or sensitive values.
+- [ ] Endpoint, repository, image, and video remain accessible for evaluation.
 
 ---
 
-## Appendix C — Interpretation test cases (seed for the paraphrase bench)
-
-Capacity is assumed to be 250 kWh where a percentage is involved.
-
-| Note | Expected interpretation |
-|---|---|
-| "PV output falls to roughly one-fifth between 13:00 and 15:00." | `solar_reduction` [13,14], factor 0.2 |
-| "Expect a 30% drop in solar from 10 AM to noon." | `solar_reduction` [10,11], factor 0.7 |
-| "Panels offline for inverter replacement, 9–11 AM." | `solar_reduction` [9,10], factor 0.0 |
-| "Battery must stay at least 40% charged from 5 PM until 8 PM." | `minimum_battery_reserve` [17,18,19], 100 kWh |
-| "Don't let the battery fall below 60 kWh at any time today." | `minimum_battery_reserve` [0..23], 60 kWh |
-| "Charger firmware update at 1 PM (one hour)." | `no_charge_window` [13] |
-| "The battery may discharge but must not be charged from noon to 2 PM." | `no_charge_window` [12,13] |
-| "Protection relay test: battery output locked 17:00–19:00." | `no_discharge_window` [17,18] |
-| "Keep grid draw at or below 120 kWh per hour from 6 to 9 PM." | `max_grid_window` [18,19,20], 120 |
-| "Grid supply interrupted from 2 PM to 3 PM." | `max_grid_window` [14], 0 |
-| "Transformer limit of 150 kWh after 8 PM." | `max_grid_window` [20,21,22,23], 150 |
-| "Overnight maintenance from 10 PM to 2 AM: no battery charging." | `no_charge_window` [0,1,22,23] (assumption §9.1) |
-| "The solar panels will be cleaned next Tuesday." | `no_op` (another day) |
-| "EV charging bays closed 2–4 PM." | `no_op` (not the campus battery) |
-| "Evening demand will rise 10% because of an event." | `no_op` (demand changes unsupported) |
-| "Electricity tariffs go up next month." | `no_op` |
-
----
-
-## Appendix D — README outline
-
-1. Overview and architecture diagram (LLM → guardrails → LP → replay validator)
-2. Quickstart from a clean machine: clone → venv → `pip install -r requirements.txt` → copy `.env.example` to `.env` → run → `curl /health` → `curl` a public sample
-3. Configuration: env var table, model/provider used, the LLM's role
-4. Testing: `pytest`; `python scripts/eval_public.py --base-url …` with the expected result (10/10 interpretations, 10/10 valid, cost ratio 1.000)
-5. Docker: `docker pull` / `docker run` with the exact tag and digest, env vars, port
-6. API reference: request/response example, error codes
-7. Guardrails and optimizer details
-8. Dependencies and credits (FastAPI, Uvicorn, Pydantic, NumPy, SciPy/HiGHS, httpx, LLM SDKs; AI coding assistant: Claude Code), known limitations, secret handling
-
----
-
-## Appendix E — 3-minute video outline
+## 14. Three-minute video outline
 
 | Time | Content |
 |---|---|
-| 0:00–0:25 | The problem: notes → directives → valid minimum-cost schedule |
-| 0:25–1:15 | Architecture: LLM → guardrails → LP → replay validator; why the LLM returns meaning and code does the arithmetic |
-| 1:15–2:15 | Live demo: `/health`, a public sample, a paraphrased note, a malformed request returning 400 |
-| 2:15–2:45 | Testing and reliability: eval results, paraphrase bench, fallback chain, cache |
-| 2:45–3:00 | How to run it (README, Docker) |
+| 0:00–0:25 | Problem: notes → supported directives → valid minimum-cost schedule |
+| 0:25–1:15 | Architecture: LLM → deterministic guardrails → hard constraints → LP → replay |
+| 1:15–2:10 | Live demonstration of `/health` and one public/paraphrased optimization case |
+| 2:10–2:40 | Public regression, paraphrase results, latency, and controlled failure handling |
+| 2:40–3:00 | Clean run path through README and Docker |
+
+The video carries no base points. It is the first tie-break only after equal total scores.
