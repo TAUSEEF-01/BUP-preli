@@ -52,6 +52,15 @@ def test_invalid_temperature_and_effort_are_safe_errors():
     assert len(settings.config_errors) == 2
 
 
+def test_invalid_schema_mode_is_a_safe_error():
+    settings = settings_with(
+        LLM_PROVIDER="openai_compat", LLM_MODEL="model", LLM_SCHEMA_MODE="xml"
+    )
+    assert settings.primary is not None
+    assert settings.primary.schema_mode == "json_schema"
+    assert settings.config_errors == ("LLM_SCHEMA_MODE must be json_schema or json_object",)
+
+
 def test_valid_boundary_settings_are_preserved():
     settings = settings_with(
         REQUEST_DEADLINE_SECONDS="29",

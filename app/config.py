@@ -25,6 +25,7 @@ class ProviderConfig:
     base_url: str | None
     temperature: float | None
     effort: str | None
+    schema_mode: str
 
     @property
     def label(self) -> str:
@@ -146,6 +147,11 @@ def _provider(prefix: str, errors: list[str]) -> ProviderConfig | None:
         errors.append(f"{prefix}_EFFORT must be one of low, medium, high, xhigh, max")
         effort = None
 
+    schema_mode = (_get(f"{prefix}_SCHEMA_MODE") or "json_schema").lower()
+    if schema_mode not in ("json_schema", "json_object"):
+        errors.append(f"{prefix}_SCHEMA_MODE must be json_schema or json_object")
+        schema_mode = "json_schema"
+
     return ProviderConfig(
         provider=provider,
         model=model,
@@ -153,6 +159,7 @@ def _provider(prefix: str, errors: list[str]) -> ProviderConfig | None:
         base_url=_get(f"{prefix}_BASE_URL"),
         temperature=temperature,
         effort=effort,
+        schema_mode=schema_mode,
     )
 
 

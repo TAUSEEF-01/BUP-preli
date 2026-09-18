@@ -100,8 +100,20 @@ class OpenAICompatProvider:
         body: dict[str, Any] = {
             "model": self._config.model,
             "messages": [{"role": "system", "content": system}, *messages],
-            "response_format": {"type": "json_object"},
         }
+        if self._config.schema_mode == "json_schema":
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "gridwise_directives",
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+        else:
+            # Compatibility mode for models that implement JSON mode but not JSON Schema.
+            # Deterministic guardrails still validate the complete returned object.
+            body["response_format"] = {"type": "json_object"}
         if self._config.temperature is not None:
             body["temperature"] = self._config.temperature
         try:
