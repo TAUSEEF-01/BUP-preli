@@ -133,6 +133,34 @@ def test_semantic_errors_return_422(payload):
     assert response.json()["error"] == "unprocessable_entity"
 
 
+@pytest.mark.parametrize("mutator", [
+    lambda p: p["hours"][0].update(demand_kwh=1e20),
+    lambda p: p["hours"][0].update(tariff_bdt_per_kwh=1e20),
+    lambda p: p["battery"].update(capacity_kwh=1e20, initial_energy_kwh=1e20),
+    lambda p: [h.update(demand_kwh=1e11, tariff_bdt_per_kwh=1e11) for h in p["hours"]],
+])
+def test_numerically_unsafe_finite_inputs_return_controlled_422(mutator):
+    payload = mutated(mutator)
+    with make_client() as client:
+        response = post(client, payload)
+    assert response.status_code == 422
+    assert "numeric range" in response.json()["message"]
+
+
+def test_large_but_precision_safe_battery_input_is_accepted_structurally():
+    payload = mutated(lambda p: p["battery"].update(
+        capacity_kwh=1e10,
+        initial_energy_kwh=1e9,
+        minimum_energy_kwh=1e8,
+        max_charge_kwh_per_hour=0,
+        max_discharge_kwh_per_hour=0,
+    ))
+    # No provider is configured, so reaching the LLM-stage 500 proves request validation passed.
+    with make_client() as client:
+        response = post(client, payload)
+    assert response.status_code == 500
+
+
 def test_unsorted_hours_and_extra_fields_are_accepted():
     payload = mutated(lambda p: (p["hours"].reverse(), p.update(extra="ignored")))
     provider = FakeProvider(handler=ground_truth_handler(CASES))

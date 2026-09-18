@@ -17,6 +17,11 @@ BATTERY_FIELDS = (
     "max_discharge_kwh_per_hour",
 )
 
+# Above this scale, IEEE-754 spacing and aggregate multiplication can no longer reliably
+# honor the judge's absolute 0.01 kWh/BDT tolerance. Reject such inputs deterministically
+# instead of letting HiGHS misclassify a numerically ill-scaled but mathematical model.
+MAX_SAFE_NUMERIC_RESULT = 1_000_000_000_000.0
+
 
 class RequestValidationError(Exception):
     def __init__(self, status_code: int, message: str):
@@ -134,4 +139,36 @@ def _check_semantics(hours: list[HourInput], battery: BatteryInput) -> None:
     if not battery.minimum_energy_kwh <= battery.initial_energy_kwh <= battery.capacity_kwh:
         raise _unprocessable(
             "battery.initial_energy_kwh must be between minimum_energy_kwh and capacity_kwh"
+        )
+
+    named_values = [
+        (f"hour {h.hour}: {field}", getattr(h, field))
+        for h in hours
+        for field in ("demand_kwh", "solar_kwh", "tariff_bdt_per_kwh")
+    ]
+    named_values.extend(
+        (f"battery.{field}", getattr(battery, field))
+        for field in BatteryInput.__dataclass_fields__
+    )
+    for path, value in named_values:
+        if value > MAX_SAFE_NUMERIC_RESULT:
+            raise _unprocessable(
+                f"{path} exceeds the supported numeric range for 0.01 absolute precision"
+            )
+
+    # A valid response must report finite totals to 0.01 BDT. Use a conservative grid-import
+    # upper bound that assumes maximum charging in every hour and no solar/discharge offset.
+    maximum_cost = sum(
+        (h.demand_kwh + battery.max_charge_kwh_per_hour) * h.tariff_bdt_per_kwh
+        for h in hours
+    )
+    maximum_grid = sum(h.demand_kwh + battery.max_charge_kwh_per_hour for h in hours)
+    if (
+        not math.isfinite(maximum_cost)
+        or not math.isfinite(maximum_grid)
+        or maximum_cost > MAX_SAFE_NUMERIC_RESULT
+        or maximum_grid > MAX_SAFE_NUMERIC_RESULT
+    ):
+        raise _unprocessable(
+            "scenario aggregates exceed the supported numeric range for 0.01 absolute precision"
         )
