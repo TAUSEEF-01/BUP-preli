@@ -24,9 +24,16 @@ def post(client, payload):
 
 
 def test_health():
-    with make_client() as client:
+    provider = FakeProvider(handler=ground_truth_handler(CASES))
+    with make_client(provider) as client:
         response = client.get("/health")
     assert response.status_code == 200 and response.json() == {"status": "ok"}
+
+
+def test_health_is_unready_without_an_llm():
+    with make_client() as client:
+        response = client.get("/health")
+    assert response.status_code == 503 and response.json() == {"status": "error"}
 
 
 def test_valid_request_returns_exact_schema():
@@ -130,6 +137,27 @@ def test_no_configured_llm_is_a_controlled_500():
     assert response.status_code == 500
     assert response.json() == {"error": "internal_error",
                                "message": "The request could not be processed. Please retry later."}
+
+
+def test_successful_warmup_precedes_readiness():
+    answer = json.dumps({"interpretations": [{
+        "note_index": 0,
+        "applies": False,
+        "directive_type": "no_op",
+        "structured_adjustment": None,
+        "explanation": "Unrelated note.",
+    }]})
+    provider = FakeProvider(responses=[answer])
+    with make_client(provider, warmup=True) as client:
+        assert client.get("/health").status_code == 200
+    assert len(provider.calls) == 1
+
+
+def test_failed_warmup_keeps_service_unready():
+    provider = FakeProvider(responses=[ProviderError("http_401")])
+    with make_client(provider, warmup=True) as client:
+        response = client.get("/health")
+    assert response.status_code == 503 and response.json() == {"status": "error"}
 
 
 def test_provider_failure_without_backup_is_a_controlled_500_not_a_fallback():

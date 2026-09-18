@@ -1,8 +1,6 @@
 """FastAPI service: GET /health and POST /optimize-energy."""
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import logging
 import time
 import uuid
@@ -37,13 +35,15 @@ def _warmup_scenario() -> Scenario:
     return Scenario("warmup", ("The cafeteria menu changes tomorrow.",), hours, battery)
 
 
-async def _warmup(interpreter: Interpreter) -> None:
+async def _warmup(interpreter: Interpreter) -> bool:
     """Pay one-time costs (connection setup, schema compilation) before the first real request."""
     try:
         await interpreter.interpret(_warmup_scenario(), time.monotonic() + 30)
         logger.info("LLM warm-up completed")
+        return True
     except Exception as exc:
         logger.warning("LLM warm-up failed: %s", type(exc).__name__)
+        return False
 
 
 def create_app(settings: Settings | None = None, interpreter: Interpreter | None = None) -> FastAPI:
@@ -56,16 +56,20 @@ def create_app(settings: Settings | None = None, interpreter: Interpreter | None
         for problem in settings.config_errors:
             logger.error("configuration: %s", problem)
         app.state.interpreter = interpreter or Interpreter.from_settings(settings)
+        app.state.ready = False
         if not app.state.interpreter.configured:
-            logger.error("no LLM provider configured: POST /optimize-energy will return 500")
-        warmup_task = None
-        if settings.warmup and app.state.interpreter.configured:
-            warmup_task = asyncio.create_task(_warmup(app.state.interpreter))
+            logger.error("no LLM provider configured: service is not ready")
+        elif settings.config_errors:
+            logger.error("invalid configuration: service is not ready")
+        elif settings.warmup:
+            # Warm up before readiness so it cannot occupy the LLM semaphore behind a 200
+            # health response and delay the first judge request.
+            app.state.ready = await _warmup(app.state.interpreter)
+        else:
+            # Useful for deterministic tests and providers where a paid warm-up is undesirable.
+            # This verifies configuration only, not remote credentials.
+            app.state.ready = True
         yield
-        if warmup_task is not None:
-            warmup_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await warmup_task
         await app.state.interpreter.aclose()
 
     app = FastAPI(title="GridWise LLM", version="1.0.0", lifespan=lifespan)
@@ -81,8 +85,10 @@ def create_app(settings: Settings | None = None, interpreter: Interpreter | None
         return _error(500, GENERIC_500)
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health(request: Request) -> JSONResponse:
+        if request.app.state.ready:
+            return JSONResponse(content={"status": "ok"})
+        return JSONResponse(status_code=503, content={"status": "error"})
 
     @app.post("/optimize-energy")
     async def optimize_energy(request: Request) -> JSONResponse:
