@@ -53,13 +53,18 @@ def compare(directive, expected: dict) -> dict[str, bool]:
     return result
 
 
-async def run(items: list[dict], concurrency: int) -> None:
+async def run(items: list[dict], concurrency: int) -> int:
+    if not items:
+        print("No evaluation cases selected.")
+        return 2
     settings = dataclasses.replace(load_settings(), cache_size=0, warmup=False)
     interpreter = Interpreter.from_settings(settings)
     if not interpreter.configured:
         print("No LLM configured. Set LLM_PROVIDER, LLM_MODEL and LLM_API_KEY (see .env.example).")
-        return
-    print(f"Model: {settings.primary.label if settings.primary else '-'}  items: {len(items)}\n")
+        await interpreter.aclose()
+        return 2
+    configured = settings.primary or settings.backup
+    print(f"Model: {configured.label if configured else '-'}  items: {len(items)}\n")
     semaphore = asyncio.Semaphore(concurrency)
 
     async def one(item):
@@ -109,9 +114,11 @@ async def run(items: list[dict], concurrency: int) -> None:
     ordered = sorted(latencies)
     print(f"\nLatency per request p50/p95/max: {ordered[len(ordered) // 2]:.0f} / "
           f"{ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]:.0f} / {ordered[-1]:.0f} ms")
+    core = scores["core"]
+    return 0 if core["notes"] > 0 and core["entry"] == core["notes"] else 1
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--only", nargs="*", help="item ids to run")
     parser.add_argument("--concurrency", type=int, default=1)
@@ -119,8 +126,8 @@ def main() -> None:
     items = json.loads(DATA.read_text(encoding="utf-8"))["cases"]
     if args.only:
         items = [item for item in items if item["id"] in set(args.only)]
-    asyncio.run(run(items, max(1, args.concurrency)))
+    return asyncio.run(run(items, max(1, args.concurrency)))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

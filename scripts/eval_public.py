@@ -30,8 +30,10 @@ DEFAULT_CASES = ROOT / "BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json"
 TOLERANCE = 0.01
 
 
-def interpretation_errors(got: list, expected: list) -> list[str]:
+def interpretation_errors(got: object, expected: list) -> list[str]:
     errors = []
+    if not isinstance(got, list):
+        return ["directive_interpretation is not an array"]
     if len(got) != len(expected):
         return [f"expected {len(expected)} entries, got {len(got)}"]
     for g, e in zip(got, expected):
@@ -52,7 +54,12 @@ def interpretation_errors(got: list, expected: list) -> list[str]:
         if ga["hours"] != ea["hours"]:
             errors.append(f"note {i}: hours {ga['hours']} != {ea['hours']}")
         for key in set(ea) - {"hours"}:
-            if abs(float(ga[key]) - float(ea[key])) > TOLERANCE:
+            try:
+                difference = abs(float(ga[key]) - float(ea[key]))
+            except (TypeError, ValueError, OverflowError):
+                errors.append(f"note {i}: {key} is not numeric")
+                continue
+            if not math.isfinite(difference) or difference > TOLERANCE:
                 errors.append(f"note {i}: {key} {ga[key]} != {ea[key]}")
     return errors
 
@@ -71,14 +78,27 @@ def main() -> int:
     args = parser.parse_args()
 
     cases = json.loads(Path(args.cases).read_text(encoding="utf-8"))["cases"]
+    if not cases or args.repeat < 1:
+        print("At least one case and one repeat are required.")
+        return 2
     url = args.base_url.rstrip("/") + "/optimize-energy"
     latencies: list[float] = []
     totals = {"requests": 0, "http_ok": 0, "interpretation_ok": 0, "valid": 0, "optimal": 0}
     ratios: list[float] = []
 
+    health_ok = False
     with httpx.Client(timeout=args.timeout) as client:
-        health = client.get(args.base_url.rstrip("/") + "/health")
-        print(f"GET /health -> {health.status_code} {health.text.strip()}")
+        try:
+            health = client.get(args.base_url.rstrip("/") + "/health")
+            try:
+                health_body = health.json()
+            except ValueError:
+                health_body = None
+            health_ok = health.status_code == 200 and health_body == {"status": "ok"}
+            print(f"GET /health -> {health.status_code} {health.text.strip()} "
+                  f"({'PASS' if health_ok else 'FAIL'})")
+        except httpx.HTTPError as exc:
+            print(f"GET /health failed ({type(exc).__name__})")
         for _ in range(args.repeat):
             for case in cases:
                 totals["requests"] += 1
@@ -98,9 +118,18 @@ def main() -> int:
                     ratios.append(0.0)
                     continue
                 totals["http_ok"] += 1
-                body = response.json()
+                try:
+                    body = response.json()
+                except ValueError:
+                    print(f"{case['id']}: HTTP 200 with invalid JSON")
+                    ratios.append(0.0)
+                    continue
+                if not isinstance(body, dict):
+                    print(f"{case['id']}: HTTP 200 body is not a JSON object")
+                    ratios.append(0.0)
+                    continue
 
-                interp = interpretation_errors(body.get("directive_interpretation", []),
+                interp = interpretation_errors(body.get("directive_interpretation"),
                                                expected["directive_interpretation"])
                 scenario = parse_scenario(json.dumps(case["input"]).encode())
                 truth = validate_interpretations({"interpretations": expected["directive_interpretation"]},
@@ -108,8 +137,20 @@ def main() -> int:
                 violations = replay(scenario, truth, body, tolerance=TOLERANCE)
                 cost = body.get("total_cost_bdt")
                 valid = not violations
-                ratio = min(1.0, expected["total_cost_bdt"] / cost) if valid and cost else (1.0 if valid else 0.0)
-                optimal = valid and abs(cost - expected["total_cost_bdt"]) <= TOLERANCE
+                numeric_cost = (
+                    isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                    and math.isfinite(cost) and cost >= 0
+                )
+                if valid and numeric_cost and cost > TOLERANCE:
+                    ratio = min(1.0, expected["total_cost_bdt"] / cost)
+                elif valid and numeric_cost and expected["total_cost_bdt"] <= TOLERANCE:
+                    ratio = 1.0
+                else:
+                    ratio = 0.0
+                optimal = (
+                    valid and numeric_cost
+                    and abs(cost - expected["total_cost_bdt"]) <= TOLERANCE
+                )
                 ratios.append(ratio)
                 totals["interpretation_ok"] += not interp
                 totals["valid"] += valid
@@ -130,7 +171,8 @@ def main() -> int:
     print(f"  mean quality ratio:    {sum(ratios) / len(ratios):.4f}")
     print(f"  latency p50/p95/max:   {percentile(latencies, 50):.0f} / {percentile(latencies, 95):.0f} / "
           f"{max(latencies):.0f} ms")
-    return 0 if totals["interpretation_ok"] == totals["optimal"] == n else 1
+    complete = all(totals[field] == n for field in ("http_ok", "interpretation_ok", "valid", "optimal"))
+    return 0 if health_ok and complete else 1
 
 
 if __name__ == "__main__":
