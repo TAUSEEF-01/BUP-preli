@@ -34,6 +34,23 @@ class PipelineResult:
     timings_ms: dict[str, float] = field(default_factory=dict)
 
 
+async def _solve_before_deadline(
+    scenario: Scenario, directives: list[Directive], deadline: float
+) -> dict[str, Any]:
+    """Run the blocking solver/replay without allowing the HTTP path to exceed its deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise PipelineError("request deadline exhausted before optimization")
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(solve_and_build, scenario, directives), timeout=remaining
+        )
+    except TimeoutError:
+        # asyncio cannot stop a SciPy call already running in its worker thread, but the request
+        # is released on time and the bounded 24-hour LP will finish independently.
+        raise PipelineError("optimization exceeded the request deadline") from None
+
+
 def solve_and_build(scenario: Scenario, directives: list[Directive]) -> dict[str, Any]:
     """Solve, serialize, and replay. Raises InfeasibleError or PipelineError."""
     limits = compile_limits(scenario, directives)
@@ -57,7 +74,7 @@ async def run_pipeline(scenario: Scenario, interpreter: Interpreter, settings: S
 
     solve_started = time.monotonic()
     try:
-        response = await asyncio.to_thread(solve_and_build, scenario, interpretation.directives)
+        response = await _solve_before_deadline(scenario, interpretation.directives, deadline)
     except InfeasibleError:
         # Organizer scenarios are feasible under the true directives, so this points at a
         # misreading. Never relax a directive; try one independent re-interpretation instead.
@@ -73,7 +90,7 @@ async def run_pipeline(scenario: Scenario, interpreter: Interpreter, settings: S
             interpreter.evict(scenario)
             raise PipelineError("directives are infeasible") from None
         try:
-            response = await asyncio.to_thread(solve_and_build, scenario, retry.directives)
+            response = await _solve_before_deadline(scenario, retry.directives, deadline)
         except InfeasibleError:
             interpreter.evict(scenario)
             raise PipelineError("directives are infeasible after re-interpretation") from None

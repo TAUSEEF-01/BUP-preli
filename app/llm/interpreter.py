@@ -114,21 +114,26 @@ class Interpreter:
 
     async def _call(self, provider: LLMProvider, messages: list[dict[str, str]], deadline: float,
                     attempts: list[str]) -> str | None:
-        remaining = deadline - time.monotonic() - RESERVED_SECONDS
+        call_deadline = deadline - RESERVED_SECONDS
+        remaining = call_deadline - time.monotonic()
         if remaining < MIN_ATTEMPT_SECONDS:
             attempts.append(f"{provider.label}:skipped_deadline")
             return None
-        timeout = min(self._settings.llm_timeout_seconds, remaining)
         started = time.monotonic()
         try:
-            async with self._semaphore:
-                text = await asyncio.wait_for(
-                    provider.complete(SYSTEM_PROMPT, messages, OUTPUT_SCHEMA, timeout), timeout + 0.5
-                )
+            # The absolute timeout includes time spent waiting for provider capacity. Without
+            # this, a queued request can begin a full provider call after its deadline expired.
+            async with asyncio.timeout_at(call_deadline):
+                async with self._semaphore:
+                    remaining = call_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    timeout = min(self._settings.llm_timeout_seconds, remaining)
+                    text = await provider.complete(SYSTEM_PROMPT, messages, OUTPUT_SCHEMA, timeout)
         except ProviderError as exc:
             attempts.append(f"{provider.label}:{exc}")
             return None
-        except asyncio.TimeoutError:
+        except TimeoutError:
             attempts.append(f"{provider.label}:timeout")
             return None
         except Exception as exc:  # never let a provider bug crash the request
