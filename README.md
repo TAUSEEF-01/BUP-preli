@@ -11,7 +11,7 @@ constraint, and returns the minimum-cost valid 24-hour grid / solar / battery sc
 | Health endpoint | `GET /health` → `{"status":"ok"}` |
 | Main endpoint | `POST /optimize-energy` |
 | Public base URL | **TODO before submission:** `https://…` |
-| Docker image | **TODO before submission:** `docker.io/<user>/gridwise-llm:1.0.0` (digest `sha256:…`) |
+| Docker image | `naimul747/gridwise-llm:latest` (digest `sha256:ddaf89ed23d15e639ba5b300e44d436f3148bf349ed6b3fa487216af488013c9`) |
 | LLM used for judging | **TODO before submission:** provider + exact model identifier |
 | Optimizer | Linear program solved with HiGHS (SciPy `linprog`) |
 | Port | `8000` (override with `PORT`) |
@@ -208,27 +208,68 @@ every returned plan against the **organizer** directives, not ours. `pytest` cur
 
 ---
 
-## 6. Docker
+## 6. Docker (Fallback Image)
 
-The image contains no secrets. Pass configuration at runtime.
+### Submission Requirement Checklist
+- [x] **Fallback Docker image is submitted with an exact pullable tag/digest; documented docker pull/run commands work, /health becomes ready, the documented port is exposed, and no secrets are baked into the image.**
 
+### Image Specification
+| Property | Value |
+|---|---|
+| Registry / Repository | `docker.io/naimul747/gridwise-llm` |
+| Tag | `latest` (and `1.0.0`) |
+| Digest | `sha256:ddaf89ed23d15e639ba5b300e44d436f3148bf349ed6b3fa487216af488013c9` |
+| Pullable Reference (Tag) | `docker pull naimul747/gridwise-llm:latest` |
+| Pullable Reference (Digest) | `docker pull naimul747/gridwise-llm@sha256:ddaf89ed23d15e639ba5b300e44d436f3148bf349ed6b3fa487216af488013c9` |
+| Exposed Port | `8000` (container listens on `0.0.0.0:8000`, configurable via `PORT`) |
+| Secrets Status | **No secrets baked into image** (keys injected at runtime via environment variables) |
+| Health Check | Built-in Docker `HEALTHCHECK` verifying readiness on `/health` |
+
+### Documented Pull and Run Commands
+
+**1. Pull the image:**
 ```bash
-docker pull docker.io/<user>/gridwise-llm:1.0.0
-docker run --rm -p 8000:8000 \
-  -e LLM_PROVIDER=<provider> -e LLM_MODEL=<model> -e LLM_API_KEY=<key> \
-  docker.io/<user>/gridwise-llm:1.0.0
+docker pull naimul747/gridwise-llm:latest
+# or by exact digest:
+docker pull naimul747/gridwise-llm@sha256:ddaf89ed23d15e639ba5b300e44d436f3148bf349ed6b3fa487216af488013c9
+```
+
+**2. Run the container:**
+Pass the required LLM credentials and configuration at runtime via environment variables:
+```bash
+docker run --rm -d --name gridwise -p 8000:8000 \
+  -e LLM_PROVIDER=<provider> \
+  -e LLM_MODEL=<model> \
+  -e LLM_API_KEY=<key> \
+  naimul747/gridwise-llm:latest
+```
+
+Alternatively, pass a local `.env` file:
+```bash
+docker run --rm -d --name gridwise -p 8000:8000 --env-file .env naimul747/gridwise-llm:latest
+```
+
+**3. Verify `/health` readiness:**
+```bash
 curl http://localhost:8000/health
+# {"status":"ok"}
 ```
 
-`--env-file .env` also works. Build and publish:
-
+**4. Test sample request:**
 ```bash
-docker build -t <user>/gridwise-llm:1.0.0 .
-docker push <user>/gridwise-llm:1.0.0
-docker inspect --format '{{index .RepoDigests 0}}' <user>/gridwise-llm:1.0.0
+curl -X POST http://localhost:8000/optimize-energy \
+  -H "Content-Type: application/json" \
+  -d '{"scenario_id":"TEST-01","operator_notes":["Cafeteria closed."],"hourly":[{"hour":0,"demand_kwh":50,"solar_kwh":0,"grid_tariff_bdt_per_kwh":10}],"battery":{"capacity_kwh":100,"initial_energy_kwh":50,"minimum_energy_kwh":10,"max_charge_kw":20,"max_discharge_kw":20}}'
 ```
 
-The container runs as a non-root user, binds `0.0.0.0:${PORT:-8000}` and has a HEALTHCHECK on `/health`.
+### Build and Publish Reference
+```bash
+docker build -t naimul747/gridwise-llm:latest .
+docker push naimul747/gridwise-llm:latest
+docker inspect --format '{{index .RepoDigests 0}}' naimul747/gridwise-llm:latest
+```
+
+The container runs as a non-root user (`appuser`), binds `0.0.0.0:${PORT:-8000}`, and has an active Docker `HEALTHCHECK` on `/health`.
 
 ---
 
