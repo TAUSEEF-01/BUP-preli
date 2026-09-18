@@ -5,6 +5,8 @@ Secret values (API keys) are only held in memory and are never logged or returne
 from __future__ import annotations
 
 import os
+import logging
+import math
 from dataclasses import dataclass
 
 try:
@@ -51,22 +53,61 @@ def _get(name: str) -> str | None:
     return value or None
 
 
-def _number(name: str, default: float, errors: list[str]) -> float:
+def _number(
+    name: str, default: float, errors: list[str], *, minimum: float | None = None,
+    maximum: float | None = None
+) -> float:
     raw = _get(name)
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         errors.append(f"{name} must be a number")
         return default
+    if not math.isfinite(value):
+        errors.append(f"{name} must be finite")
+        return default
+    if minimum is not None and value < minimum:
+        errors.append(f"{name} must be at least {minimum:g}")
+        return default
+    if maximum is not None and value > maximum:
+        errors.append(f"{name} must be at most {maximum:g}")
+        return default
+    return value
 
 
-def _bool(name: str, default: bool) -> bool:
+def _integer(
+    name: str, default: int, errors: list[str], *, minimum: int, maximum: int
+) -> int:
     raw = _get(name)
     if raw is None:
         return default
-    return raw.lower() in ("1", "true", "yes", "on")
+    try:
+        value = int(raw)
+    except ValueError:
+        errors.append(f"{name} must be an integer")
+        return default
+    if str(value) != raw and raw not in (f"+{value}", f"-{abs(value)}"):
+        errors.append(f"{name} must be an integer")
+        return default
+    if not minimum <= value <= maximum:
+        errors.append(f"{name} must be between {minimum} and {maximum}")
+        return default
+    return value
+
+
+def _bool(name: str, default: bool, errors: list[str]) -> bool:
+    raw = _get(name)
+    if raw is None:
+        return default
+    normalized = raw.lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    errors.append(f"{name} must be a boolean (true/false)")
+    return default
 
 
 def _provider(prefix: str, errors: list[str]) -> ProviderConfig | None:
@@ -95,6 +136,15 @@ def _provider(prefix: str, errors: list[str]) -> ProviderConfig | None:
         except ValueError:
             errors.append(f"{prefix}_TEMPERATURE must be a number or 'none'")
             temperature = None
+        else:
+            if not math.isfinite(temperature):
+                errors.append(f"{prefix}_TEMPERATURE must be finite or 'none'")
+                temperature = None
+
+    effort = _get(f"{prefix}_EFFORT")
+    if effort is not None and effort not in ("low", "medium", "high", "xhigh", "max"):
+        errors.append(f"{prefix}_EFFORT must be one of low, medium, high, xhigh, max")
+        effort = None
 
     return ProviderConfig(
         provider=provider,
@@ -102,7 +152,7 @@ def _provider(prefix: str, errors: list[str]) -> ProviderConfig | None:
         api_key=_get(f"{prefix}_API_KEY"),
         base_url=_get(f"{prefix}_BASE_URL"),
         temperature=temperature,
-        effort=_get(f"{prefix}_EFFORT"),
+        effort=effort,
     )
 
 
@@ -114,19 +164,30 @@ def load_settings() -> Settings:
     errors: list[str] = []
     primary = _provider("LLM", errors)
     backup = _provider("LLM_BACKUP", errors)
-    deadline = _number("REQUEST_DEADLINE_SECONDS", 25.0, errors)
-    if not 5.0 <= deadline <= 29.0:
-        errors.append("REQUEST_DEADLINE_SECONDS must be between 5 and 29")
-        deadline = 25.0
+    deadline = _number(
+        "REQUEST_DEADLINE_SECONDS", 25.0, errors, minimum=5.0, maximum=29.0
+    )
+    log_level = (_get("LOG_LEVEL") or "INFO").upper()
+    if log_level not in logging.getLevelNamesMapping():
+        errors.append("LOG_LEVEL must be a standard Python logging level")
+        log_level = "INFO"
+    timeout = _number(
+        "LLM_TIMEOUT_SECONDS", 10.0, errors, minimum=1.0, maximum=29.0
+    )
+    concurrency = _integer(
+        "LLM_MAX_CONCURRENCY", 8, errors, minimum=1, maximum=100
+    )
+    cache_size = _integer("LLM_CACHE_SIZE", 512, errors, minimum=0, maximum=100_000)
+    warmup = _bool("LLM_WARMUP", True, errors)
 
     return Settings(
         primary=primary,
         backup=backup,
         config_errors=tuple(errors),
         request_deadline_seconds=deadline,
-        llm_timeout_seconds=max(1.0, _number("LLM_TIMEOUT_SECONDS", 10.0, errors)),
-        llm_max_concurrency=max(1, int(_number("LLM_MAX_CONCURRENCY", 8, errors))),
-        cache_size=max(0, int(_number("LLM_CACHE_SIZE", 512, errors))),
-        warmup=_bool("LLM_WARMUP", True),
-        log_level=(_get("LOG_LEVEL") or "INFO").upper(),
+        llm_timeout_seconds=timeout,
+        llm_max_concurrency=concurrency,
+        cache_size=cache_size,
+        warmup=warmup,
+        log_level=log_level,
     )
