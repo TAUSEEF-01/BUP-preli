@@ -8,7 +8,7 @@ an hours list and ordering entries by an already-complete set of note indices.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, TypeGuard
 
 from app.schemas import ADJUSTMENT_KEYS, DIRECTIVE_TYPES, HOURS_PER_DAY, Directive
 
@@ -22,7 +22,7 @@ class GuardrailError(Exception):
         self.errors = errors
 
 
-def _is_number(value: Any) -> bool:
+def _is_number(value: Any) -> TypeGuard[int | float]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
     try:

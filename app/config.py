@@ -4,15 +4,18 @@ Secret values (API keys) are only held in memory and are never logged or returne
 """
 from __future__ import annotations
 
-import os
 import logging
 import math
+import os
+from collections.abc import Callable
 from dataclasses import dataclass
 
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv as _dotenv_loader
 except ImportError:  # pragma: no cover - python-dotenv is in requirements.txt
-    load_dotenv = None
+    load_dotenv: Callable[..., bool] | None = None
+else:
+    load_dotenv = _dotenv_loader
 
 SUPPORTED_PROVIDERS = ("anthropic", "openai_compat")
 

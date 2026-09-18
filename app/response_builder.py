@@ -126,7 +126,12 @@ def build_response(scenario: Scenario, directives: list[Directive], limits: Hour
 
     grid_values = [r["grid_kwh"] for r in rows]
     total_grid = _clean(sum(grid_values))
-    total_cost = _clean(sum(g * h.tariff_bdt_per_kwh for g, h in zip(grid_values, scenario.hours)))
+    total_cost = _clean(
+        sum(
+            g * h.tariff_bdt_per_kwh
+            for g, h in zip(grid_values, scenario.hours, strict=True)
+        )
+    )
     peak = max(grid_values)
 
     return {

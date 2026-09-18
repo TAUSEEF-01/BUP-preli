@@ -36,7 +36,7 @@ def interpretation_errors(got: object, expected: list) -> list[str]:
         return ["directive_interpretation is not an array"]
     if len(got) != len(expected):
         return [f"expected {len(expected)} entries, got {len(got)}"]
-    for g, e in zip(got, expected):
+    for g, e in zip(got, expected, strict=True):
         i = e["note_index"]
         if g.get("note_index") != i:
             errors.append(f"note {i}: wrong note_index")
@@ -137,19 +137,24 @@ def main() -> int:
                 violations = replay(scenario, truth, body, tolerance=TOLERANCE)
                 cost = body.get("total_cost_bdt")
                 valid = not violations
-                numeric_cost = (
-                    isinstance(cost, (int, float)) and not isinstance(cost, bool)
-                    and math.isfinite(cost) and cost >= 0
+                cost_value = (
+                    float(cost)
+                    if isinstance(cost, (int, float))
+                    and not isinstance(cost, bool)
+                    and math.isfinite(cost)
+                    and cost >= 0
+                    else None
                 )
-                if valid and numeric_cost and cost > TOLERANCE:
-                    ratio = min(1.0, expected["total_cost_bdt"] / cost)
-                elif valid and numeric_cost and expected["total_cost_bdt"] <= TOLERANCE:
+                if valid and cost_value is not None and cost_value > TOLERANCE:
+                    ratio = min(1.0, expected["total_cost_bdt"] / cost_value)
+                elif valid and cost_value is not None and expected["total_cost_bdt"] <= TOLERANCE:
                     ratio = 1.0
                 else:
                     ratio = 0.0
                 optimal = (
-                    valid and numeric_cost
-                    and abs(cost - expected["total_cost_bdt"]) <= TOLERANCE
+                    valid
+                    and cost_value is not None
+                    and abs(cost_value - expected["total_cost_bdt"]) <= TOLERANCE
                 )
                 ratios.append(ratio)
                 totals["interpretation_ok"] += not interp

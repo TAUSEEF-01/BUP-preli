@@ -176,7 +176,10 @@ def replay(scenario: Scenario, directives: list[Directive], response: Any,
     grid_values = [row["grid_kwh"] for row in plan]
     totals = {
         "total_grid_kwh": sum(grid_values),
-        "total_cost_bdt": sum(g * h.tariff_bdt_per_kwh for g, h in zip(grid_values, scenario.hours)),
+        "total_cost_bdt": sum(
+            g * h.tariff_bdt_per_kwh
+            for g, h in zip(grid_values, scenario.hours, strict=True)
+        ),
         "peak_grid_kwh": max(grid_values),
     }
     for field, expected in totals.items():

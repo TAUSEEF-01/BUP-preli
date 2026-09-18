@@ -76,7 +76,7 @@ class Interpreter:
         self._semaphore = asyncio.Semaphore(settings.llm_max_concurrency)
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "Interpreter":
+    def from_settings(cls, settings: Settings) -> Interpreter:
         providers: list[LLMProvider] = []
         for config in (settings.primary, settings.backup):
             if config is None:
@@ -196,5 +196,9 @@ class Interpreter:
         for provider in self._providers:
             try:
                 await provider.aclose()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "could not close LLM provider %s: %s",
+                    provider.label,
+                    type(exc).__name__,
+                )
